@@ -1,6 +1,6 @@
 /**
  * ScreenShare Live - WebRTC Multi-Peer Screen Sharing Engine
- * Serverless Edition (MQTT Cloud Signaling + Native WebRTC Mesh)
+ * Serverless Edition (MQTT Cloud Signaling + Perfect Negotiation WebRTC Mesh)
  * 100% Compatível com Vercel / Servidores Estáticos / Sem Node.js
  */
 
@@ -11,7 +11,7 @@
   // Configurações e Estado Global
   // =========================================================================
 
-  // STUN Servers públicos de alta disponibilidade
+  // STUN + TURN Servers públicos de alta disponibilidade e bypass de NAT restritivo
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -19,12 +19,29 @@
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
       { urls: 'stun:stun4.l.google.com:19302' },
-      { urls: 'stun:global.stun.twilio.com:3478' }
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+      // OpenRelay Public TURN Server (Gratuito para conexões com firewall/NAT simétrico)
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
     ],
     iceCandidatePoolSize: 10
   };
 
-  // Lista de Brokers MQTT WebSocket Públicos e Gratuitos
+  // Lista de Brokers MQTT WebSocket Públicos e Gratuitos com failover
   const MQTT_BROKERS = [
     'wss://broker.hivemq.com:8884/mqtt',
     'wss://broker.emqx.io:8084/mqtt',
@@ -46,9 +63,11 @@
     localMicStream: null,
 
     // Conexões WebRTC Nativas
-    peerConnections: new Map(), // Map<peerId, RTCPeerConnection>
+    peerConnections: new Map(),   // Map<peerId, RTCPeerConnection>
+    makingOffer: new Map(),       // Map<peerId, boolean>
+    ignoreOffer: new Map(),       // Map<peerId, boolean>
     pendingCandidates: new Map(), // Map<peerId, RTCIceCandidateInit[]>
-    remoteStreams: new Map(),    // Map<peerId, MediaStream>
+    remoteStreams: new Map(),      // Map<peerId, MediaStream>
 
     // Sinalização MQTT
     mqttClient: null,
@@ -57,7 +76,7 @@
     heartbeatTimer: null,
     cleanupTimer: null,
 
-    // Lista de membros conhecidos na sala: Map<peerId, { id, name, isSharing, lastSeen }>`
+    // Lista de membros conhecidos na sala: Map<peerId, { id, name, isSharing, lastSeen }>
     members: new Map(),
 
     // UI State
@@ -445,7 +464,7 @@
   }
 
   // =========================================================================
-  // Processamento de Mensagens de Sinalização e WebRTC Mesh
+  // Processamento de Mensagens de Sinalização
   // =========================================================================
 
   async function handleSignalingMessage(msg) {
@@ -475,8 +494,8 @@
           isSharing: state.isSharingScreen
         });
 
-        // Inicia conexão WebRTC nativa com o participante
-        createPeerConnection(senderId, true);
+        // Garante a criação da conexão WebRTC
+        getOrCreatePeerConnection(senderId);
         break;
       }
 
@@ -494,8 +513,8 @@
           showToast(`${msg.name || 'Participante'} conectado`, 'info');
         }
 
-        // Cria conexão WebRTC (como receptor de oferta)
-        createPeerConnection(senderId, false);
+        // Garante a conexão WebRTC
+        getOrCreatePeerConnection(senderId);
         break;
       }
 
@@ -509,7 +528,7 @@
             lastSeen: Date.now()
           });
           updateParticipantsUI();
-          createPeerConnection(senderId, true);
+          getOrCreatePeerConnection(senderId);
         } else {
           existing.lastSeen = Date.now();
           if (existing.isSharing !== !!msg.isSharing) {
@@ -573,10 +592,10 @@
   }
 
   // =========================================================================
-  // Gerenciamento de Conexões WebRTC P2P (RTCPeerConnection)
+  // Gerenciamento de Conexões WebRTC P2P (Perfect Negotiation Pattern)
   // =========================================================================
 
-  function createPeerConnection(peerId, shouldCreateOffer) {
+  function getOrCreatePeerConnection(peerId) {
     if (state.peerConnections.has(peerId)) {
       const existing = state.peerConnections.get(peerId);
       if (existing.connectionState !== 'closed' && existing.connectionState !== 'failed') {
@@ -584,86 +603,142 @@
       }
     }
 
-    console.log(`[WebRTC] Criando RTCPeerConnection para peer: ${peerId} (shouldOffer: ${shouldCreateOffer})`);
+    console.log(`[WebRTC] Criando RTCPeerConnection para peer: ${peerId}`);
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
     state.peerConnections.set(peerId, pc);
+    state.makingOffer.set(peerId, false);
+    state.ignoreOffer.set(peerId, false);
     state.pendingCandidates.set(peerId, []);
 
-    // Se estivermos transmitindo tela, injeta as tracks na conexão
-    if (state.isSharingScreen && state.localScreenStream) {
-      state.localScreenStream.getTracks().forEach(track => {
-        console.log('[WebRTC] Adicionando track local para peer:', peerId, track.kind);
-        pc.addTrack(track, state.localScreenStream);
-      });
-    }
+    // Determina se este peer é "polite" (reversível) com base na ordem dos IDs
+    const isPolite = state.myPeerId > peerId;
 
-    // Evento de ICE Candidates gerados localmente
+    // Se já estivermos transmitindo tela ou mic, adiciona as tracks imediatamente
+    syncLocalTracksToPeer(pc);
+
+    // Negociação Perfeita: Triggers automáticos quando tracks são adicionadas ou modificadas
+    pc.onnegotiationneeded = async () => {
+      try {
+        state.makingOffer.set(peerId, true);
+        console.log(`[WebRTC] onnegotiationneeded disparado para ${peerId}`);
+        const offer = await pc.createOffer();
+        if (pc.signalingState !== 'stable') return;
+        await pc.setLocalDescription(offer);
+        sendDirectToPeer(peerId, 'offer', { sdp: pc.localDescription });
+      } catch (err) {
+        console.error(`[WebRTC] Erro no onnegotiationneeded com ${peerId}:`, err);
+      } finally {
+        state.makingOffer.set(peerId, false);
+      }
+    };
+
+    // Candidatos ICE locais
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         sendDirectToPeer(peerId, 'candidate', { candidate: event.candidate });
       }
     };
 
-    // Evento de recebimento de Mídia Remota
+    // Recebimento de Mídia Remota (Áudio e Vídeo)
     pc.ontrack = (event) => {
       console.log('[WebRTC] 🎥 Recebeu track remota de:', peerId, event.track.kind);
-      const stream = event.streams[0] || new MediaStream([event.track]);
       
-      state.remoteStreams.set(peerId, stream);
+      let remoteStream = state.remoteStreams.get(peerId);
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        state.remoteStreams.set(peerId, remoteStream);
+      }
+
+      // Adiciona track se ainda não estiver na MediaStream
+      if (!remoteStream.getTracks().some(t => t.id === event.track.id)) {
+        remoteStream.addTrack(event.track);
+      }
+
       const member = state.members.get(peerId);
       const peerName = member ? member.name : 'Participante Remoto';
 
       if (member) member.isSharing = true;
       updateParticipantsUI();
 
-      renderRemoteVideoCard(peerId, peerName, stream);
+      renderRemoteVideoCard(peerId, peerName, remoteStream);
       updateVideoGridLayout();
+
+      event.track.onended = () => {
+        console.log('[WebRTC] Track remota finalizada:', event.track.kind);
+        if (remoteStream.getVideoTracks().length === 0) {
+          handleRemoteStreamEnded(peerId);
+        }
+      };
     };
 
     pc.onconnectionstatechange = () => {
       console.log(`[WebRTC] Status da conexão com ${peerId}:`, pc.connectionState);
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        console.warn(`[WebRTC] Conexão com ${peerId} caiu.`);
+        console.warn(`[WebRTC] Conexão com ${peerId} desconectada.`);
       }
     };
-
-    pc.oniceconnectionstatechange = () => {
-      console.log(`[WebRTC] ICE status com ${peerId}:`, pc.iceConnectionState);
-    };
-
-    // Cria e envia Offer se formos o iniciador
-    if (shouldCreateOffer) {
-      makeOffer(peerId, pc);
-    }
 
     return pc;
   }
 
-  async function makeOffer(peerId, pc) {
-    try {
-      const offer = await pc.createOffer({
-        offerToReceiveVideo: true,
-        offerToReceiveAudio: true
-      });
-      await pc.setLocalDescription(offer);
+  function syncLocalTracksToPeer(pc) {
+    if (!pc) return;
+    const senders = pc.getSenders();
 
-      sendDirectToPeer(peerId, 'offer', { sdp: pc.localDescription });
-    } catch (err) {
-      console.error('[WebRTC] Erro ao criar SDP Offer:', err);
+    const activeTracks = [];
+    if (state.isSharingScreen && state.localScreenStream) {
+      state.localScreenStream.getTracks().forEach(t => activeTracks.push(t));
     }
+    if (state.isMicActive && state.localMicStream) {
+      state.localMicStream.getTracks().forEach(t => {
+        if (!activeTracks.some(at => at.id === t.id)) {
+          activeTracks.push(t);
+        }
+      });
+    }
+
+    // Adiciona tracks ausentes
+    activeTracks.forEach(track => {
+      const hasSender = senders.some(s => s.track && s.track.id === track.id);
+      if (!hasSender) {
+        console.log('[WebRTC] Adicionando track local ao peer:', track.kind);
+        const stream = state.localScreenStream || state.localMicStream;
+        pc.addTrack(track, stream);
+      }
+    });
+
+    // Remove tracks que não estão mais ativas
+    senders.forEach(sender => {
+      if (sender.track && !activeTracks.some(t => t.id === sender.track.id)) {
+        console.log('[WebRTC] Removendo track local inativa do peer:', sender.track.kind);
+        try { pc.removeTrack(sender); } catch (e) {}
+      }
+    });
   }
 
   async function handleReceiveOffer(senderId, sdp) {
-    let pc = state.peerConnections.get(senderId);
-    if (!pc) {
-      pc = createPeerConnection(senderId, false);
+    const pc = getOrCreatePeerConnection(senderId);
+    const isPolite = state.myPeerId > senderId;
+    const isMakingOffer = state.makingOffer.get(senderId) || false;
+
+    // Resolução de colisão de ofertas (Glare)
+    const offerCollision = isMakingOffer || pc.signalingState !== 'stable';
+    const ignoreOffer = !isPolite && offerCollision;
+    state.ignoreOffer.set(senderId, ignoreOffer);
+
+    if (ignoreOffer) {
+      console.log(`[WebRTC] Ignorando oferta concorrente de ${senderId} (Impolite Peer)`);
+      return;
     }
 
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (offerCollision) {
+        console.log(`[WebRTC] Revertendo estado para aceitar oferta remota de ${senderId} (Polite Peer)`);
+        await pc.setLocalDescription({ type: 'rollback' });
+      }
 
-      // Processa candidatos ICE que chegaram antes da Offer
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
       flushPendingIceCandidates(senderId, pc);
 
       const answer = await pc.createAnswer();
@@ -699,7 +774,9 @@
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
-      console.warn('[WebRTC] Erro ao adicionar ICE Candidate:', err);
+      if (!state.ignoreOffer.get(senderId)) {
+        console.warn('[WebRTC] Erro ao adicionar ICE Candidate:', err);
+      }
     }
   }
 
@@ -724,6 +801,8 @@
       try { state.peerConnections.get(peerId).close(); } catch (e) {}
       state.peerConnections.delete(peerId);
     }
+    state.makingOffer.delete(peerId);
+    state.ignoreOffer.delete(peerId);
     state.pendingCandidates.delete(peerId);
 
     handleRemoteStreamEnded(peerId);
@@ -794,12 +873,9 @@
         isSharing: true
       });
 
-      // Adiciona as tracks aos peer connections existentes e renegocia
-      state.peerConnections.forEach((pc, peerId) => {
-        stream.getTracks().forEach(track => {
-          pc.addTrack(track, stream);
-        });
-        makeOffer(peerId, pc);
+      // Sincroniza tracks locais com todas as conexões WebRTC ativas
+      state.peerConnections.forEach(pc => {
+        syncLocalTracksToPeer(pc);
       });
 
       // Detecta encerramento pelo botão nativo do navegador
@@ -848,13 +924,9 @@
       isSharing: false
     });
 
-    // Remove tracks e renegocia com todos
-    state.peerConnections.forEach((pc, peerId) => {
-      const senders = pc.getSenders();
-      senders.forEach(sender => {
-        try { pc.removeTrack(sender); } catch (e) {}
-      });
-      makeOffer(peerId, pc);
+    // Remove tracks locais das conexões ativas
+    state.peerConnections.forEach(pc => {
+      syncLocalTracksToPeer(pc);
     });
 
     const localCard = document.getElementById('video-card-local');
@@ -966,6 +1038,11 @@
       state.isMicActive = false;
       dom.btnToggleMic.classList.remove('active');
       dom.iconMic.setAttribute('data-lucide', 'mic-off');
+
+      state.peerConnections.forEach(pc => {
+        syncLocalTracksToPeer(pc);
+      });
+
       showToast('Microfone desligado', 'info');
     } else {
       try {
@@ -975,13 +1052,9 @@
         dom.btnToggleMic.classList.add('active');
         dom.iconMic.setAttribute('data-lucide', 'mic');
 
-        // Se já estiver transmitindo tela, acopla o áudio
-        if (state.isSharingScreen && state.localScreenStream) {
-          micStream.getAudioTracks().forEach(t => {
-            state.localScreenStream.addTrack(t);
-            state.peerConnections.forEach(pc => pc.addTrack(t, state.localScreenStream));
-          });
-        }
+        state.peerConnections.forEach(pc => {
+          syncLocalTracksToPeer(pc);
+        });
 
         showToast('Microfone ativado', 'success');
       } catch (err) {
@@ -1061,8 +1134,43 @@
   }
 
   // =========================================================================
-  // Renderização da Grade de Vídeo
+  // Reprodução de Vídeo e Renderização da Grade
   // =========================================================================
+
+  function attachStreamToVideo(videoEl, stream, isLocal = false) {
+    if (!videoEl || !stream) return;
+
+    if (videoEl.srcObject !== stream) {
+      videoEl.srcObject = stream;
+    }
+
+    videoEl.playsInline = true;
+    videoEl.autoplay = true;
+
+    if (isLocal) {
+      videoEl.muted = true;
+    } else {
+      videoEl.volume = state.globalVolume;
+      videoEl.muted = state.isRemoteAudioMuted;
+    }
+
+    const startPlayback = () => {
+      const playPromise = videoEl.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(err => {
+          console.warn('[Video] Play automático com som bloqueado, tentando com áudio mutado:', err);
+          videoEl.muted = true;
+          videoEl.play().catch(e => console.error('[Video] Erro na reprodução do vídeo:', e));
+        });
+      }
+    };
+
+    if (videoEl.readyState >= 2) {
+      startPlayback();
+    } else {
+      videoEl.onloadedmetadata = () => startPlayback();
+    }
+  }
 
   function renderLocalVideoCard(stream) {
     let card = document.getElementById('video-card-local');
@@ -1110,9 +1218,7 @@
     }
 
     const videoEl = card.querySelector('#local-video');
-    if (videoEl) {
-      videoEl.srcObject = stream;
-    }
+    attachStreamToVideo(videoEl, stream, true);
 
     if (window.lucide) window.lucide.createIcons();
   }
@@ -1227,11 +1333,7 @@
     }
 
     const videoEl = card.querySelector(`#video-${peerId}`);
-    if (videoEl) {
-      videoEl.srcObject = stream;
-      videoEl.volume = state.globalVolume;
-      videoEl.muted = state.isRemoteAudioMuted;
-    }
+    attachStreamToVideo(videoEl, stream, false);
 
     if (window.lucide) window.lucide.createIcons();
   }
