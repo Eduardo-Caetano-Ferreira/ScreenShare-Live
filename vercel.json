@@ -1,13 +1,10 @@
 {
   "version": 2,
+  "outputDirectory": "public",
   "rewrites": [
     {
-      "source": "/(.*)",
-      "destination": "/public/$1"
-    },
-    {
       "source": "/room/(.*)",
-      "destination": "/public/index.html"
+      "destination": "/index.html"
     }
   ]
 }
