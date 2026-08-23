@@ -1,7 +1,7 @@
 /**
  * ScreenShare Live - WebRTC Multi-Peer Screen Sharing Engine
- * Serverless Client Edition (Vanilla JS + PeerJS Cloud + WebRTC Mesh)
- * 100% Compatível com Vercel / GitHub Pages / Servidores Estáticos
+ * Serverless Edition (MQTT Cloud Signaling + Native WebRTC Mesh)
+ * 100% Compatível com Vercel / Servidores Estáticos / Sem Node.js
  */
 
 (function () {
@@ -11,26 +11,33 @@
   // Configurações e Estado Global
   // =========================================================================
 
-  // STUN Servers públicos do Google
-  const ICE_CONFIG = {
+  // STUN Servers públicos de alta disponibilidade
+  const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
       { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' }
-    ]
+      { urls: 'stun:stun4.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' }
+    ],
+    iceCandidatePoolSize: 10
   };
 
+  // Lista de Brokers MQTT WebSocket Públicos e Gratuitos
+  const MQTT_BROKERS = [
+    'wss://broker.hivemq.com:8884/mqtt',
+    'wss://broker.emqx.io:8084/mqtt',
+    'wss://test.mosquitto.org:8081'
+  ];
+
   const state = {
-    peer: null,              // Instância do PeerJS
-    myPeerId: null,          // ID único gerado no formato: room_ROOMID_UUID
+    myPeerId: null,          // ID único gerado para esta sessão
     roomId: null,            // ID da sala (ex: dev-team-123)
     userName: '',            // Nome do usuário
-    isHost: false,           // Se é quem iniciou ou primeiro participante
     isSharingScreen: false,  // Se está transmitindo tela
-    isMicActive: false,      // Se microfone está ativo
-    isRemoteAudioMuted: false,
+    isMicActive: false,      // Se microfone local está ativo
+    isRemoteAudioMuted: false, // Se mutou o áudio remoto geral
     globalVolume: 1.0,       // Nível de volume geral (0.0 a 1.0)
     focusedStreamId: null,
 
@@ -38,22 +45,25 @@
     localScreenStream: null,
     localMicStream: null,
 
-    // Conexões Ativas:
-    // dataConns: Map<peerId, DataConnection>
-    dataConns: new Map(),
-    // mediaCalls: Map<peerId, MediaConnection> (chamadas que enviamos ou recebemos)
-    mediaCalls: new Map(),
-    // remoteStreams: Map<peerId, { stream, userName, isSharing }>
-    remoteStreams: new Map(),
+    // Conexões WebRTC Nativas
+    peerConnections: new Map(), // Map<peerId, RTCPeerConnection>
+    pendingCandidates: new Map(), // Map<peerId, RTCIceCandidateInit[]>
+    remoteStreams: new Map(),    // Map<peerId, MediaStream>
 
-    // Lista de membros conhecidos na sala: Map<peerId, { id, name, isSharing }>
+    // Sinalização MQTT
+    mqttClient: null,
+    mqttConnected: false,
+    currentBrokerIndex: 0,
+    heartbeatTimer: null,
+    cleanupTimer: null,
+
+    // Lista de membros conhecidos na sala: Map<peerId, { id, name, isSharing, lastSeen }>`
     members: new Map(),
 
     // UI State
     isSidebarOpen: false,
     currentTab: 'chat',
-    unreadMessages: 0,
-    roomPrefix: 'ssl_' // ScreenShare Live room prefix
+    unreadMessages: 0
   };
 
   // Elementos do DOM
@@ -129,7 +139,7 @@
       dom.userNameInput.value = savedName;
     }
 
-    // Verificar room ID na URL
+    // Verificar se existe room ID na URL
     const urlParams = new URLSearchParams(window.location.search);
     let roomIdFromUrl = urlParams.get('room');
 
@@ -203,7 +213,7 @@
 
     dom.chatForm.addEventListener('submit', handleSendChatMessage);
 
-    // Encerramento garantido ao sair da página
+    // Encerramento limpo ao fechar ou atualizar aba
     window.addEventListener('beforeunload', () => {
       leaveRoomSilently();
     });
@@ -214,7 +224,7 @@
   }
 
   // =========================================================================
-  // Gerenciamento de Salas (PeerJS Mesh)
+  // Gerenciamento de Salas
   // =========================================================================
 
   function generateRoomId() {
@@ -243,16 +253,13 @@
       return;
     }
 
-    // Aceita tanto código simples quanto URL completa colada pelo usuário
     let roomId = rawCode;
     try {
       if (rawCode.includes('?room=')) {
         const parsed = new URL(rawCode);
         roomId = parsed.searchParams.get('room') || rawCode;
       }
-    } catch (e) {
-      // continua com rawCode
-    }
+    } catch (e) {}
 
     localStorage.setItem('screenshare_username', userName);
     joinRoom(roomId, userName);
@@ -261,6 +268,7 @@
   function joinRoom(roomId, userName) {
     state.roomId = sanitizeRoomId(roomId);
     state.userName = userName;
+    state.myPeerId = 'usr_' + Math.random().toString(36).substring(2, 9);
 
     // Atualiza a URL sem recarregar a página
     const newUrl = `${window.location.origin}/?room=${encodeURIComponent(state.roomId)}`;
@@ -270,345 +278,439 @@
     dom.lobbyModal.classList.add('hidden');
     dom.roomContainer.classList.remove('hidden');
 
-    // Inicializa a conexão PeerJS Serverless
-    initPeerJS();
+    // Registra a si mesmo na lista de membros locais
+    state.members.set(state.myPeerId, {
+      id: state.myPeerId,
+      name: state.userName,
+      isSharing: false,
+      lastSeen: Date.now()
+    });
+    updateParticipantsUI();
 
-    showToast(`Conectando à sala: ${state.roomId}`, 'info');
+    // Inicializa a sinalização WebRTC Serverless via MQTT
+    initMqttSignaling();
+
+    showToast(`Entrando na sala: ${state.roomId}`, 'info');
   }
 
   function sanitizeRoomId(id) {
     return id.toLowerCase().replace(/[^a-z0-9_-]/g, '-').substring(0, 30);
   }
 
-  // Gera o ID fixo do Host da sala
-  function getHostPeerId(roomId) {
-    return `${state.roomPrefix}${roomId}_host`;
-  }
-
-  // Gera ID aleatório para participantes
-  function generateMemberPeerId(roomId) {
-    const rand = Math.random().toString(36).substring(2, 8);
-    return `${state.roomPrefix}${roomId}_peer_${rand}`;
-  }
-
   // =========================================================================
-  // Inicialização do PeerJS Client (Serverless Cloud)
+  // Sinalização Serverless via MQTT (Nuvem Pública Resiliente)
   // =========================================================================
 
-  function initPeerJS() {
-    dom.connectionStatusText.textContent = 'Conectando PeerJS...';
-
-    // Primeiro, tentamos nos conectar como Host da sala (ID fixo)
-    const targetHostId = getHostPeerId(state.roomId);
-
-    // Se a instância anterior existir, destruímos
-    if (state.peer) {
-      try { state.peer.destroy(); } catch (e) {}
-      state.peer = null;
-    }
-
-    // Tentar criar com ID de Host
-    createPeerInstance(targetHostId, true);
-  }
-
-  function createPeerInstance(desiredId, isAttemptingHost) {
-    const peerOptions = {
-      config: ICE_CONFIG,
-      debug: 1
+  function getTopics(roomId, peerId) {
+    return {
+      broadcast: `screenshare_live/v1/${roomId}/broadcast`,
+      direct: `screenshare_live/v1/${roomId}/peer/${peerId}`
     };
-
-    const peer = new Peer(desiredId, peerOptions);
-
-    peer.on('open', (id) => {
-      state.myPeerId = id;
-      state.isHost = isAttemptingHost;
-      console.log(`[PeerJS] Conectado com sucesso como ${isAttemptingHost ? 'HOST' : 'MEMBRO'}. ID:`, id);
-
-      dom.connectionStatusText.textContent = 'Conectado P2P';
-      showToast('Conectado à rede P2P com sucesso!', 'success');
-
-      // Adiciona a si mesmo na lista de membros
-      state.members.set(state.myPeerId, {
-        id: state.myPeerId,
-        name: state.userName,
-        isSharing: false
-      });
-      updateParticipantsUI();
-
-      if (!isAttemptingHost) {
-        // Como membro, conecta imediatamente ao Host da sala
-        const hostId = getHostPeerId(state.roomId);
-        connectToPeer(hostId);
-      }
-    });
-
-    // Se o ID já estiver em uso (o Host já existe), conectamos como participante normal
-    peer.on('error', (err) => {
-      console.warn('[PeerJS] Erro:', err.type, err);
-
-      if (isAttemptingHost && (err.type === 'unavailable-id' || err.type === 'invalid-id')) {
-        console.log('[PeerJS] Sala já possui Host ativo. Conectando como participante...');
-        peer.destroy();
-        const memberId = generateMemberPeerId(state.roomId);
-        createPeerInstance(memberId, false);
-        return;
-      }
-
-      if (err.type === 'peer-unavailable') {
-        console.log('[PeerJS] Peer indisponível:', err);
-      } else {
-        dom.connectionStatusText.textContent = 'Erro P2P';
-        showToast(`Aviso P2P: ${err.message || err.type}`, 'info');
-      }
-    });
-
-    // =======================================================================
-    // Recebimento de Conexões de Dados (Chat, Handshake, Membros)
-    // =======================================================================
-    peer.on('connection', (conn) => {
-      setupDataConnection(conn);
-    });
-
-    // =======================================================================
-    // Recebimento de Chamadas de Mídia (Transmissão de Tela)
-    // =======================================================================
-    peer.on('call', (call) => {
-      console.log('[PeerJS] 📞 Recebeu chamada de vídeo de:', call.peer);
-
-      // Respondemos com stream vazio se não estivermos transmitindo, ou com nosso stream se estivermos
-      const answerStream = state.localScreenStream || createSilentMediaStream();
-      call.answer(answerStream);
-
-      state.mediaCalls.set(call.peer, call);
-
-      call.on('stream', (remoteStream) => {
-        console.log('[PeerJS] 🎥 Recebeu stream de tela de:', call.peer);
-        
-        // Obter nome do participante
-        const member = state.members.get(call.peer);
-        const peerName = member ? member.name : 'Participante Remoto';
-
-        state.remoteStreams.set(call.peer, {
-          stream: remoteStream,
-          userName: peerName,
-          isSharing: true
-        });
-
-        if (member) member.isSharing = true;
-        updateParticipantsUI();
-
-        renderRemoteVideoCard(call.peer, peerName, remoteStream);
-        updateVideoGridLayout();
-      });
-
-      call.on('close', () => {
-        console.log('[PeerJS] Chamada encerrada por:', call.peer);
-        handleRemoteStreamEnded(call.peer);
-      });
-
-      call.on('error', (err) => {
-        console.warn('[PeerJS] Erro na chamada com:', call.peer, err);
-      });
-    });
-
-    peer.on('disconnected', () => {
-      console.warn('[PeerJS] Desconectado da nuvem de sinalização. Tentando reconectar...');
-      dom.connectionStatusText.textContent = 'Reconectando...';
-      try {
-        peer.reconnect();
-      } catch (e) {}
-    });
-
-    peer.on('close', () => {
-      console.log('[PeerJS] Conexão destruída.');
-    });
-
-    state.peer = peer;
   }
 
-  // Cria um stream vazio para responder chamadas quando só estamos assistindo
-  function createSilentMediaStream() {
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = 2;
-      canvas.height = 2;
-      return canvas.captureStream ? canvas.captureStream(1) : new MediaStream();
-    } catch (e) {
-      return new MediaStream();
+  function initMqttSignaling() {
+    dom.connectionStatusText.textContent = 'Conectando rede P2P...';
+
+    if (state.mqttClient) {
+      try { state.mqttClient.end(true); } catch (e) {}
+      state.mqttClient = null;
     }
-  }
 
-  // =========================================================================
-  // Gerenciamento de Canais de Dados (Mesh de Sincronização)
-  // =========================================================================
+    const brokerUrl = MQTT_BROKERS[state.currentBrokerIndex % MQTT_BROKERS.length];
+    console.log(`[Signaling] Conectando ao broker MQTT (${brokerUrl})...`);
 
-  function connectToPeer(targetPeerId) {
-    if (!state.peer || state.dataConns.has(targetPeerId) || targetPeerId === state.myPeerId) {
+    if (!window.mqtt) {
+      dom.connectionStatusText.textContent = 'Erro de Biblioteca';
+      showToast('Erro ao carregar módulo de conexão. Verifique sua internet.', 'danger');
       return;
     }
 
-    console.log('[PeerJS] Conectando data channel com:', targetPeerId);
-    const conn = state.peer.connect(targetPeerId, {
-      reliable: true,
-      metadata: { name: state.userName, isSharing: state.isSharingScreen }
+    const clientId = `ssl_${state.myPeerId}_${Math.random().toString(16).substring(2, 8)}`;
+    const client = window.mqtt.connect(brokerUrl, {
+      clientId,
+      clean: true,
+      connectTimeout: 8000,
+      reconnectPeriod: 3000,
+      keepalive: 30
     });
 
-    setupDataConnection(conn);
-  }
+    const topics = getTopics(state.roomId, state.myPeerId);
 
-  function setupDataConnection(conn) {
-    conn.on('open', () => {
-      console.log('[PeerJS] Canal de dados aberto com:', conn.peer);
-      state.dataConns.set(conn.peer, conn);
+    client.on('connect', () => {
+      state.mqttConnected = true;
+      dom.connectionStatusText.textContent = 'Conectado P2P';
+      console.log('[Signaling] Conectado ao broker MQTT com sucesso!');
 
-      // Envia nosso handshake de entrada
-      sendToPeer(conn, {
-        type: 'handshake',
-        senderId: state.myPeerId,
-        name: state.userName,
-        isSharing: state.isSharingScreen
+      // Inscreve no canal de broadcast da sala e no canal direto deste usuário
+      client.subscribe([topics.broadcast, topics.direct], { qos: 0 }, (err) => {
+        if (!err) {
+          console.log('[Signaling] Inscrito nos tópicos da sala:', topics);
+          
+          // Anuncia entrada para todos na sala
+          publishToRoom('join', {
+            peerId: state.myPeerId,
+            name: state.userName,
+            isSharing: state.isSharingScreen
+          });
+
+          startHeartbeat();
+        }
       });
+    });
 
-      // Se nós somos o Host, enviamos a lista completa de membros para que a malha (mesh) se forme
-      if (state.isHost) {
-        const memberList = Array.from(state.members.values());
-        sendToPeer(conn, {
-          type: 'member-list',
-          members: memberList
-        });
-      }
-
-      // Se já estamos transmitindo tela, iniciamos a chamada de mídia para ele
-      if (state.isSharingScreen && state.localScreenStream) {
-        callPeerWithScreen(conn.peer);
+    client.on('message', (topic, message) => {
+      try {
+        const payload = JSON.parse(message.toString());
+        handleSignalingMessage(payload);
+      } catch (err) {
+        console.warn('[Signaling] Mensagem com formato inválido recebida:', err);
       }
     });
 
-    conn.on('data', (data) => {
-      handleIncomingData(conn.peer, data);
+    client.on('error', (err) => {
+      console.warn('[Signaling] Erro no broker MQTT:', err);
+      tryFallbackBroker();
     });
 
-    conn.on('close', () => {
-      console.log('[PeerJS] Canal de dados fechado com:', conn.peer);
-      handlePeerLeft(conn.peer);
+    client.on('close', () => {
+      state.mqttConnected = false;
+      dom.connectionStatusText.textContent = 'Reconectando...';
     });
 
-    conn.on('error', (err) => {
-      console.warn('[PeerJS] Erro no canal de dados:', err);
-    });
+    state.mqttClient = client;
   }
 
-  function handleIncomingData(senderPeerId, data) {
-    if (!data || !data.type) return;
+  function tryFallbackBroker() {
+    if (state.currentBrokerIndex < MQTT_BROKERS.length - 1) {
+      state.currentBrokerIndex++;
+      console.log('[Signaling] Tentando broker alternativo:', MQTT_BROKERS[state.currentBrokerIndex]);
+      setTimeout(() => initMqttSignaling(), 1000);
+    }
+  }
 
-    switch (data.type) {
-      case 'handshake': {
-        const isNew = !state.members.has(senderPeerId);
-        state.members.set(senderPeerId, {
-          id: senderPeerId,
-          name: data.name || 'Participante',
-          isSharing: !!data.isSharing
+  function publishToRoom(type, data = {}) {
+    if (!state.mqttClient || !state.mqttConnected) return;
+
+    const topics = getTopics(state.roomId, state.myPeerId);
+    const message = JSON.stringify({
+      type,
+      senderId: state.myPeerId,
+      senderName: state.userName,
+      ...data
+    });
+
+    state.mqttClient.publish(topics.broadcast, message, { qos: 0 });
+  }
+
+  function sendDirectToPeer(targetPeerId, type, data = {}) {
+    if (!state.mqttClient || !state.mqttConnected) return;
+
+    const topics = getTopics(state.roomId, targetPeerId);
+    const message = JSON.stringify({
+      type,
+      senderId: state.myPeerId,
+      senderName: state.userName,
+      targetPeerId,
+      ...data
+    });
+
+    state.mqttClient.publish(topics.direct, message, { qos: 0 });
+  }
+
+  function startHeartbeat() {
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    if (state.cleanupTimer) clearInterval(state.cleanupTimer);
+
+    // Envia presença a cada 6 segundos
+    state.heartbeatTimer = setInterval(() => {
+      if (state.mqttConnected) {
+        publishToRoom('presence', {
+          peerId: state.myPeerId,
+          name: state.userName,
+          isSharing: state.isSharingScreen
         });
+      }
+    }, 6000);
 
+    // Limpa membros que não enviam ping há mais de 18 segundos
+    state.cleanupTimer = setInterval(() => {
+      const now = Date.now();
+      state.members.forEach((member, peerId) => {
+        if (peerId !== state.myPeerId && now - (member.lastSeen || 0) > 18000) {
+          console.log('[Signaling] Membro inativo removido:', member.name, peerId);
+          handlePeerLeft(peerId);
+        }
+      });
+    }, 10000);
+  }
+
+  // =========================================================================
+  // Processamento de Mensagens de Sinalização e WebRTC Mesh
+  // =========================================================================
+
+  async function handleSignalingMessage(msg) {
+    if (!msg || !msg.type || msg.senderId === state.myPeerId) return;
+
+    const senderId = msg.senderId;
+
+    switch (msg.type) {
+      case 'join': {
+        const isNew = !state.members.has(senderId);
+        state.members.set(senderId, {
+          id: senderId,
+          name: msg.name || 'Participante',
+          isSharing: !!msg.isSharing,
+          lastSeen: Date.now()
+        });
         updateParticipantsUI();
 
         if (isNew) {
-          showToast(`${data.name || 'Novo participante'} entrou na sala`, 'info');
+          showToast(`${msg.name || 'Novo participante'} entrou na sala`, 'info');
         }
 
-        // Se somos o host, propagamos para os outros participantes para que todos se conectem entre si
-        if (state.isHost) {
-          broadcastData({
-            type: 'member-joined',
-            member: { id: senderPeerId, name: data.name, isSharing: data.isSharing }
-          }, senderPeerId);
-        }
+        // Responde de volta para o novo membro com nossos dados
+        sendDirectToPeer(senderId, 'welcome', {
+          peerId: state.myPeerId,
+          name: state.userName,
+          isSharing: state.isSharingScreen
+        });
+
+        // Inicia conexão WebRTC nativa com o participante
+        createPeerConnection(senderId, true);
         break;
       }
 
-      case 'member-list': {
-        if (Array.isArray(data.members)) {
-          data.members.forEach(member => {
-            if (member.id !== state.myPeerId) {
-              state.members.set(member.id, member);
-              // Conecta aos outros membros da sala para formar o mesh completo
-              if (!state.dataConns.has(member.id)) {
-                connectToPeer(member.id);
-              }
-            }
+      case 'welcome': {
+        const isNew = !state.members.has(senderId);
+        state.members.set(senderId, {
+          id: senderId,
+          name: msg.name || 'Participante',
+          isSharing: !!msg.isSharing,
+          lastSeen: Date.now()
+        });
+        updateParticipantsUI();
+
+        if (isNew) {
+          showToast(`${msg.name || 'Participante'} conectado`, 'info');
+        }
+
+        // Cria conexão WebRTC (como receptor de oferta)
+        createPeerConnection(senderId, false);
+        break;
+      }
+
+      case 'presence': {
+        const existing = state.members.get(senderId);
+        if (!existing) {
+          state.members.set(senderId, {
+            id: senderId,
+            name: msg.name || 'Participante',
+            isSharing: !!msg.isSharing,
+            lastSeen: Date.now()
           });
           updateParticipantsUI();
-        }
-        break;
-      }
-
-      case 'member-joined': {
-        if (data.member && data.member.id !== state.myPeerId) {
-          state.members.set(data.member.id, data.member);
-          updateParticipantsUI();
-          showToast(`${data.member.name} entrou na sala`, 'info');
-
-          // Conecta ao novo membro para fechar a malha P2P
-          if (!state.dataConns.has(data.member.id)) {
-            connectToPeer(data.member.id);
+          createPeerConnection(senderId, true);
+        } else {
+          existing.lastSeen = Date.now();
+          if (existing.isSharing !== !!msg.isSharing) {
+            existing.isSharing = !!msg.isSharing;
+            updateParticipantsUI();
           }
         }
         break;
       }
 
+      case 'offer': {
+        console.log('[WebRTC] Recebeu SDP Offer de:', senderId);
+        await handleReceiveOffer(senderId, msg.sdp);
+        break;
+      }
+
+      case 'answer': {
+        console.log('[WebRTC] Recebeu SDP Answer de:', senderId);
+        await handleReceiveAnswer(senderId, msg.sdp);
+        break;
+      }
+
+      case 'candidate': {
+        if (msg.candidate) {
+          await handleReceiveIceCandidate(senderId, msg.candidate);
+        }
+        break;
+      }
+
       case 'sharing-status': {
-        const member = state.members.get(senderPeerId);
+        const member = state.members.get(senderId);
         if (member) {
-          member.isSharing = data.isSharing;
+          member.isSharing = !!msg.isSharing;
           updateParticipantsUI();
         }
 
-        if (!data.isSharing) {
-          handleRemoteStreamEnded(senderPeerId);
-          showToast(`${data.userName || 'Participante'} finalizou a transmissão.`, 'info');
+        if (!msg.isSharing) {
+          handleRemoteStreamEnded(senderId);
+          showToast(`${msg.userName || 'Participante'} finalizou a transmissão.`, 'info');
         } else {
-          showToast(`${data.userName || 'Participante'} iniciou compartilhamento de tela.`, 'info');
+          showToast(`${msg.userName || 'Participante'} iniciou compartilhamento de tela.`, 'info');
         }
         break;
       }
 
       case 'chat': {
         appendChatMessage({
-          senderId: senderPeerId,
-          senderName: data.senderName,
-          text: data.text,
-          time: data.time
+          senderId,
+          senderName: msg.senderName,
+          text: msg.text,
+          time: msg.time
         });
         break;
       }
 
       case 'leave': {
-        handlePeerLeft(senderPeerId);
+        handlePeerLeft(senderId);
         break;
       }
     }
   }
 
-  function broadcastData(payload, excludePeerId = null) {
-    state.dataConns.forEach((conn, peerId) => {
-      if (peerId !== excludePeerId && conn.open) {
-        try {
-          conn.send(payload);
-        } catch (e) {
-          console.warn('Erro ao enviar dados para peer:', peerId, e);
-        }
-      }
-    });
-  }
+  // =========================================================================
+  // Gerenciamento de Conexões WebRTC P2P (RTCPeerConnection)
+  // =========================================================================
 
-  function sendToPeer(conn, payload) {
-    if (conn && conn.open) {
-      try {
-        conn.send(payload);
-      } catch (e) {
-        console.warn('Erro ao enviar dados para peer:', e);
+  function createPeerConnection(peerId, shouldCreateOffer) {
+    if (state.peerConnections.has(peerId)) {
+      const existing = state.peerConnections.get(peerId);
+      if (existing.connectionState !== 'closed' && existing.connectionState !== 'failed') {
+        return existing;
       }
     }
+
+    console.log(`[WebRTC] Criando RTCPeerConnection para peer: ${peerId} (shouldOffer: ${shouldCreateOffer})`);
+
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    state.peerConnections.set(peerId, pc);
+    state.pendingCandidates.set(peerId, []);
+
+    // Se estivermos transmitindo tela, injeta as tracks na conexão
+    if (state.isSharingScreen && state.localScreenStream) {
+      state.localScreenStream.getTracks().forEach(track => {
+        console.log('[WebRTC] Adicionando track local para peer:', peerId, track.kind);
+        pc.addTrack(track, state.localScreenStream);
+      });
+    }
+
+    // Evento de ICE Candidates gerados localmente
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendDirectToPeer(peerId, 'candidate', { candidate: event.candidate });
+      }
+    };
+
+    // Evento de recebimento de Mídia Remota
+    pc.ontrack = (event) => {
+      console.log('[WebRTC] 🎥 Recebeu track remota de:', peerId, event.track.kind);
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      
+      state.remoteStreams.set(peerId, stream);
+      const member = state.members.get(peerId);
+      const peerName = member ? member.name : 'Participante Remoto';
+
+      if (member) member.isSharing = true;
+      updateParticipantsUI();
+
+      renderRemoteVideoCard(peerId, peerName, stream);
+      updateVideoGridLayout();
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Status da conexão com ${peerId}:`, pc.connectionState);
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        console.warn(`[WebRTC] Conexão com ${peerId} caiu.`);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] ICE status com ${peerId}:`, pc.iceConnectionState);
+    };
+
+    // Cria e envia Offer se formos o iniciador
+    if (shouldCreateOffer) {
+      makeOffer(peerId, pc);
+    }
+
+    return pc;
+  }
+
+  async function makeOffer(peerId, pc) {
+    try {
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true
+      });
+      await pc.setLocalDescription(offer);
+
+      sendDirectToPeer(peerId, 'offer', { sdp: pc.localDescription });
+    } catch (err) {
+      console.error('[WebRTC] Erro ao criar SDP Offer:', err);
+    }
+  }
+
+  async function handleReceiveOffer(senderId, sdp) {
+    let pc = state.peerConnections.get(senderId);
+    if (!pc) {
+      pc = createPeerConnection(senderId, false);
+    }
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+
+      // Processa candidatos ICE que chegaram antes da Offer
+      flushPendingIceCandidates(senderId, pc);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      sendDirectToPeer(senderId, 'answer', { sdp: pc.localDescription });
+    } catch (err) {
+      console.error('[WebRTC] Erro ao responder SDP Offer:', err);
+    }
+  }
+
+  async function handleReceiveAnswer(senderId, sdp) {
+    const pc = state.peerConnections.get(senderId);
+    if (!pc) return;
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      flushPendingIceCandidates(senderId, pc);
+    } catch (err) {
+      console.error('[WebRTC] Erro ao processar SDP Answer:', err);
+    }
+  }
+
+  async function handleReceiveIceCandidate(senderId, candidate) {
+    const pc = state.peerConnections.get(senderId);
+    if (!pc || !pc.remoteDescription) {
+      const list = state.pendingCandidates.get(senderId) || [];
+      list.push(candidate);
+      state.pendingCandidates.set(senderId, list);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.warn('[WebRTC] Erro ao adicionar ICE Candidate:', err);
+    }
+  }
+
+  function flushPendingIceCandidates(peerId, pc) {
+    const list = state.pendingCandidates.get(peerId) || [];
+    list.forEach(async (cand) => {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch (e) {}
+    });
+    state.pendingCandidates.set(peerId, []);
   }
 
   function handlePeerLeft(peerId) {
@@ -618,12 +720,11 @@
       state.members.delete(peerId);
     }
 
-    state.dataConns.delete(peerId);
-    
-    if (state.mediaCalls.has(peerId)) {
-      try { state.mediaCalls.get(peerId).close(); } catch (e) {}
-      state.mediaCalls.delete(peerId);
+    if (state.peerConnections.has(peerId)) {
+      try { state.peerConnections.get(peerId).close(); } catch (e) {}
+      state.peerConnections.delete(peerId);
     }
+    state.pendingCandidates.delete(peerId);
 
     handleRemoteStreamEnded(peerId);
     updateParticipantsUI();
@@ -640,7 +741,7 @@
   }
 
   // =========================================================================
-  // Transmissão de Tela (Screen Sharing via PeerJS MediaCalls)
+  // Transmissão de Tela (Screen Sharing)
   // =========================================================================
 
   async function toggleScreenSharing() {
@@ -670,7 +771,7 @@
         audio: true
       });
 
-      // Se o microfone local estiver ativo, junta as tracks de áudio
+      // Se o microfone local estiver ativo, acopla a track de áudio
       if (state.isMicActive && state.localMicStream) {
         state.localMicStream.getAudioTracks().forEach(t => stream.addTrack(t));
       }
@@ -688,16 +789,17 @@
       updateVideoGridLayout();
 
       // Notifica todos na sala que estamos transmitindo
-      broadcastData({
-        type: 'sharing-status',
-        senderId: state.myPeerId,
+      publishToRoom('sharing-status', {
         userName: state.userName,
         isSharing: true
       });
 
-      // Liga chamada de vídeo com cada participante conectado
-      state.dataConns.forEach((_, peerId) => {
-        callPeerWithScreen(peerId);
+      // Adiciona as tracks aos peer connections existentes e renegocia
+      state.peerConnections.forEach((pc, peerId) => {
+        stream.getTracks().forEach(track => {
+          pc.addTrack(track, stream);
+        });
+        makeOffer(peerId, pc);
       });
 
       // Detecta encerramento pelo botão nativo do navegador
@@ -717,19 +819,6 @@
         showToast(`Erro ao compartilhar tela: ${err.message}`, 'danger');
       }
       stopScreenSharing();
-    }
-  }
-
-  function callPeerWithScreen(targetPeerId) {
-    if (!state.peer || !state.localScreenStream || targetPeerId === state.myPeerId) return;
-
-    console.log('[PeerJS] Chamando peer com transmissão de tela:', targetPeerId);
-    const call = state.peer.call(targetPeerId, state.localScreenStream);
-    if (call) {
-      state.mediaCalls.set(targetPeerId, call);
-      call.on('error', (err) => {
-        console.warn('[PeerJS] Erro na chamada com:', targetPeerId, err);
-      });
     }
   }
 
@@ -754,18 +843,19 @@
     updateShareButtonUI(false);
 
     // Notifica todos os participantes para remover a visualização
-    broadcastData({
-      type: 'sharing-status',
-      senderId: state.myPeerId,
+    publishToRoom('sharing-status', {
       userName: state.userName,
       isSharing: false
     });
 
-    // Fecha as chamadas de mídia ativas
-    state.mediaCalls.forEach(call => {
-      try { call.close(); } catch (e) {}
+    // Remove tracks e renegocia com todos
+    state.peerConnections.forEach((pc, peerId) => {
+      const senders = pc.getSenders();
+      senders.forEach(sender => {
+        try { pc.removeTrack(sender); } catch (e) {}
+      });
+      makeOffer(peerId, pc);
     });
-    state.mediaCalls.clear();
 
     const localCard = document.getElementById('video-card-local');
     if (localCard) localCard.remove();
@@ -808,9 +898,19 @@
         try { t.stop(); } catch (e) {}
       });
     }
-    broadcastData({ type: 'leave', senderId: state.myPeerId });
-    if (state.peer) {
-      try { state.peer.destroy(); } catch (e) {}
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    if (state.cleanupTimer) clearInterval(state.cleanupTimer);
+
+    publishToRoom('leave');
+
+    state.peerConnections.forEach(pc => {
+      try { pc.close(); } catch (e) {}
+    });
+    state.peerConnections.clear();
+
+    if (state.mqttClient) {
+      try { state.mqttClient.end(true); } catch (e) {}
+      state.mqttClient = null;
     }
   }
 
@@ -821,10 +921,7 @@
     state.isMicActive = false;
     state.localScreenStream = null;
     state.localMicStream = null;
-    state.peer = null;
     state.myPeerId = null;
-    state.dataConns.clear();
-    state.mediaCalls.clear();
     state.remoteStreams.clear();
     state.members.clear();
 
@@ -857,7 +954,7 @@
   }
 
   // =========================================================================
-  // Microfone Auxiliar
+  // Microfone e Controles de Som
   // =========================================================================
 
   async function toggleMicrophone() {
@@ -880,7 +977,10 @@
 
         // Se já estiver transmitindo tela, acopla o áudio
         if (state.isSharingScreen && state.localScreenStream) {
-          micStream.getAudioTracks().forEach(t => state.localScreenStream.addTrack(t));
+          micStream.getAudioTracks().forEach(t => {
+            state.localScreenStream.addTrack(t);
+            state.peerConnections.forEach(pc => pc.addTrack(t, state.localScreenStream));
+          });
         }
 
         showToast('Microfone ativado', 'success');
@@ -900,7 +1000,6 @@
       video.muted = state.isRemoteAudioMuted;
     });
 
-    // Atualiza todos os botões e sliders dos cards individuais
     const cardVolBtns = dom.videoGrid.querySelectorAll('.video-card-volume-btn');
     cardVolBtns.forEach(btn => {
       const icon = btn.querySelector('i');
@@ -940,7 +1039,6 @@
       dom.iconVolume.setAttribute('data-lucide', val < 50 ? 'volume-1' : 'volume-2');
     }
 
-    // Aplica o volume em todos os vídeos remotos
     const remoteCards = dom.videoGrid.querySelectorAll('.video-card:not(.local-user)');
     remoteCards.forEach(card => {
       const video = card.querySelector('video');
@@ -1043,7 +1141,7 @@
         </div>
 
         <div class="video-overlay-bottom">
-          <!-- Controle de Volume da Transmissão -->
+          <!-- Controle de Volume da Transmissão Remota -->
           <div class="video-card-volume-group" title="Volume da Transmissão">
             <button class="video-card-volume-btn" data-action="toggle-card-mute" title="Mutar/Desmutar som desta tela">
               <i data-lucide="volume-2"></i>
@@ -1202,7 +1300,7 @@
   }
 
   // =========================================================================
-  // Chat da Sala (P2P Mesh)
+  // Chat da Sala
   // =========================================================================
 
   function handleSendChatMessage(e) {
@@ -1223,8 +1321,8 @@
     // Exibe localmente
     appendChatMessage(messageData);
 
-    // Envia para todos os outros
-    broadcastData(messageData);
+    // Envia para todos na sala
+    publishToRoom('chat', messageData);
 
     dom.chatInput.value = '';
     dom.chatInput.focus();
