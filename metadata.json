@@ -1,0 +1,6 @@
+{
+  "name": "ScreenShare Live",
+  "description": "Aplicação em tempo real para compartilhamento de tela colaborativo multi-peer com WebRTC e Node.js Socket.io.",
+  "requestFramePermissions": ["display-capture", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
