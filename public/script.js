@@ -13,6 +13,7 @@
 
   // STUN + TURN Servers públicos de alta disponibilidade e bypass de NAT restritivo
   const RTC_CONFIG = {
+    sdpSemantics: 'unified-plan',
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
@@ -23,17 +24,11 @@
       { urls: 'stun:global.stun.twilio.com:3478' },
       // OpenRelay Public TURN Server (Gratuito para conexões com firewall/NAT simétrico)
       {
-        urls: 'turn:openrelay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-      },
-      {
-        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turn:openrelay.metered.ca:443?transport=tcp'
+        ],
         username: 'openrelayproject',
         credential: 'openrelayproject'
       }
@@ -57,6 +52,7 @@
     isRemoteAudioMuted: false, // Se mutou o áudio remoto geral
     globalVolume: 1.0,       // Nível de volume geral (0.0 a 1.0)
     focusedStreamId: null,
+    userHasInteracted: false, // Interação do usuário para destravar áudio
 
     // Mídias Locais
     localScreenStream: null,
@@ -67,7 +63,7 @@
     makingOffer: new Map(),       // Map<peerId, boolean>
     ignoreOffer: new Map(),       // Map<peerId, boolean>
     pendingCandidates: new Map(), // Map<peerId, RTCIceCandidateInit[]>
-    remoteStreams: new Map(),      // Map<peerId, MediaStream>
+    remoteStreams: new Map(),     // Map<peerId, MediaStream>
 
     // Sinalização MQTT
     mqttClient: null,
@@ -157,6 +153,18 @@
     if (savedName) {
       dom.userNameInput.value = savedName;
     }
+
+    // Registrar interação global do usuário para destravar reprodução de áudio
+    const unlockAudio = () => {
+      state.userHasInteracted = true;
+      tryUnmuteAllRemoteVideos();
+      document.removeEventListener('click', unlockAudio);
+      document.removeEventListener('keydown', unlockAudio);
+      document.removeEventListener('touchstart', unlockAudio);
+    };
+    document.addEventListener('click', unlockAudio, { passive: true });
+    document.addEventListener('keydown', unlockAudio, { passive: true });
+    document.addEventListener('touchstart', unlockAudio, { passive: true });
 
     // Verificar se existe room ID na URL
     const urlParams = new URLSearchParams(window.location.search);
@@ -322,8 +330,8 @@
 
   function getTopics(roomId, peerId) {
     return {
-      broadcast: `screenshare_live/v1/${roomId}/broadcast`,
-      direct: `screenshare_live/v1/${roomId}/peer/${peerId}`
+      broadcast: `ssl_v2/${roomId}/bc`,
+      direct: `ssl_v2/${roomId}/p/${peerId}`
     };
   }
 
@@ -363,7 +371,7 @@
       // Inscreve no canal de broadcast da sala e no canal direto deste usuário
       client.subscribe([topics.broadcast, topics.direct], { qos: 0 }, (err) => {
         if (!err) {
-          console.log('[Signaling] Inscrito nos tópicos da sala:', topics);
+          console.log('[Signaling] Inscrito nos tópicos:', topics);
           
           // Anuncia entrada para todos na sala
           publishToRoom('join', {
@@ -569,7 +577,10 @@
           handleRemoteStreamEnded(senderId);
           showToast(`${msg.userName || 'Participante'} finalizou a transmissão.`, 'info');
         } else {
-          showToast(`${msg.userName || 'Participante'} iniciou compartilhamento de tela.`, 'info');
+          showToast(`${msg.userName || 'Participante'} iniciou transmissão de tela.`, 'info');
+          // Força verificação da conexão para garantir o recebimento das tracks
+          const pc = getOrCreatePeerConnection(senderId);
+          syncLocalTracksToPeer(pc);
         }
         break;
       }
@@ -611,20 +622,15 @@
     state.ignoreOffer.set(peerId, false);
     state.pendingCandidates.set(peerId, []);
 
-    // Determina se este peer é "polite" (reversível) com base na ordem dos IDs
-    const isPolite = state.myPeerId > peerId;
-
-    // Se já estivermos transmitindo tela ou mic, adiciona as tracks imediatamente
+    // Sincroniza tracks locais
     syncLocalTracksToPeer(pc);
 
-    // Negociação Perfeita: Triggers automáticos quando tracks são adicionadas ou modificadas
+    // Negociação Perfeita (W3C Standard)
     pc.onnegotiationneeded = async () => {
       try {
         state.makingOffer.set(peerId, true);
         console.log(`[WebRTC] onnegotiationneeded disparado para ${peerId}`);
-        const offer = await pc.createOffer();
-        if (pc.signalingState !== 'stable') return;
-        await pc.setLocalDescription(offer);
+        await pc.setLocalDescription();
         sendDirectToPeer(peerId, 'offer', { sdp: pc.localDescription });
       } catch (err) {
         console.error(`[WebRTC] Erro no onnegotiationneeded com ${peerId}:`, err);
@@ -642,17 +648,21 @@
 
     // Recebimento de Mídia Remota (Áudio e Vídeo)
     pc.ontrack = (event) => {
-      console.log('[WebRTC] 🎥 Recebeu track remota de:', peerId, event.track.kind);
+      console.log('[WebRTC] 🎥 Recebeu track remota de:', peerId, event.track.kind, event.streams);
       
-      let remoteStream = state.remoteStreams.get(peerId);
-      if (!remoteStream) {
-        remoteStream = new MediaStream();
-        state.remoteStreams.set(peerId, remoteStream);
-      }
+      let remoteStream = (event.streams && event.streams[0]) ? event.streams[0] : null;
 
-      // Adiciona track se ainda não estiver na MediaStream
-      if (!remoteStream.getTracks().some(t => t.id === event.track.id)) {
-        remoteStream.addTrack(event.track);
+      if (!remoteStream) {
+        remoteStream = state.remoteStreams.get(peerId);
+        if (!remoteStream) {
+          remoteStream = new MediaStream();
+          state.remoteStreams.set(peerId, remoteStream);
+        }
+        if (!remoteStream.getTracks().some(t => t.id === event.track.id)) {
+          remoteStream.addTrack(event.track);
+        }
+      } else {
+        state.remoteStreams.set(peerId, remoteStream);
       }
 
       const member = state.members.get(peerId);
@@ -666,7 +676,8 @@
 
       event.track.onended = () => {
         console.log('[WebRTC] Track remota finalizada:', event.track.kind);
-        if (remoteStream.getVideoTracks().length === 0) {
+        const curStream = state.remoteStreams.get(peerId);
+        if (!curStream || curStream.getVideoTracks().length === 0 || curStream.getVideoTracks().every(t => t.readyState === 'ended')) {
           handleRemoteStreamEnded(peerId);
         }
       };
@@ -741,9 +752,7 @@
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
       flushPendingIceCandidates(senderId, pc);
 
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
+      await pc.setLocalDescription(await pc.createAnswer());
       sendDirectToPeer(senderId, 'answer', { sdp: pc.localDescription });
     } catch (err) {
       console.error('[WebRTC] Erro ao responder SDP Offer:', err);
@@ -755,8 +764,10 @@
     if (!pc) return;
 
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      flushPendingIceCandidates(senderId, pc);
+      if (pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        flushPendingIceCandidates(senderId, pc);
+      }
     } catch (err) {
       console.error('[WebRTC] Erro ao processar SDP Answer:', err);
     }
@@ -764,7 +775,7 @@
 
   async function handleReceiveIceCandidate(senderId, candidate) {
     const pc = state.peerConnections.get(senderId);
-    if (!pc || !pc.remoteDescription) {
+    if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
       const list = state.pendingCandidates.get(senderId) || [];
       list.push(candidate);
       state.pendingCandidates.set(senderId, list);
@@ -834,21 +845,28 @@
   async function startScreenSharing() {
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-        showToast('Seu navegador não suporta a API de compartilhamento de tela.', 'danger');
+        showToast('Seu navegador não suporta compartilhamento de tela.', 'danger');
         return;
       }
 
-      // Captura da tela em alta resolução e taxa de quadros
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          cursor: 'always',
-          displaySurface: 'monitor',
-          frameRate: { ideal: 60, max: 60 },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        },
-        audio: true
-      });
+      // Captura da tela com fallback automático se o sistema operacional não suportar áudio de janela
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            cursor: 'always',
+            displaySurface: 'monitor'
+          },
+          audio: true
+        });
+      } catch (audioErr) {
+        console.log('[WebRTC] Tentando captura sem restrição de áudio de sistema...');
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { cursor: 'always' }
+        });
+      }
+
+      if (!stream) return;
 
       // Se o microfone local estiver ativo, acopla a track de áudio
       if (state.isMicActive && state.localMicStream) {
@@ -890,7 +908,7 @@
       showToast('Transmissão de tela iniciada com sucesso!', 'success');
 
     } catch (err) {
-      console.warn('[WebRTC] Erro ou cancelamento ao compartilhar tela:', err);
+      console.warn('[WebRTC] Cancelamento ou erro ao compartilhar tela:', err);
       if (err.name !== 'NotAllowedError') {
         showToast(`Erro ao compartilhar tela: ${err.message}`, 'danger');
       }
@@ -1071,6 +1089,10 @@
     const remoteVideos = dom.videoGrid.querySelectorAll('video:not(#local-video)');
     remoteVideos.forEach(video => {
       video.muted = state.isRemoteAudioMuted;
+      if (!state.isRemoteAudioMuted) {
+        video.volume = state.globalVolume;
+        video.play().catch(() => {});
+      }
     });
 
     const cardVolBtns = dom.videoGrid.querySelectorAll('.video-card-volume-btn');
@@ -1091,6 +1113,18 @@
       showToast('Áudio de transmissões desmutado.', 'info');
     }
     if (window.lucide) window.lucide.createIcons();
+  }
+
+  function tryUnmuteAllRemoteVideos() {
+    if (state.isRemoteAudioMuted) return;
+    const remoteVideos = dom.videoGrid.querySelectorAll('video:not(#local-video)');
+    remoteVideos.forEach(video => {
+      video.muted = false;
+      video.volume = state.globalVolume;
+      video.play().catch(err => {
+        console.warn('[Video] Não foi possível reproduzir com som:', err);
+      });
+    });
   }
 
   function handleGlobalVolumeChange(e) {
@@ -1121,6 +1155,9 @@
       if (video) {
         video.volume = volumeFraction;
         video.muted = state.isRemoteAudioMuted;
+        if (!state.isRemoteAudioMuted) {
+          video.play().catch(() => {});
+        }
       }
       if (slider) {
         slider.value = val;
@@ -1140,36 +1177,51 @@
   function attachStreamToVideo(videoEl, stream, isLocal = false) {
     if (!videoEl || !stream) return;
 
-    if (videoEl.srcObject !== stream) {
-      videoEl.srcObject = stream;
-    }
-
+    // Sempre vincula o objeto de stream
+    videoEl.srcObject = stream;
     videoEl.playsInline = true;
     videoEl.autoplay = true;
+    videoEl.setAttribute('playsinline', '');
+    videoEl.setAttribute('webkit-playsinline', '');
+    videoEl.setAttribute('autoplay', '');
 
+    // Para evitar bloqueio de autoplay (que deixaria a tela preta),
+    // inicia o vídeo como muted inicialmente.
     if (isLocal) {
       videoEl.muted = true;
     } else {
-      videoEl.volume = state.globalVolume;
-      videoEl.muted = state.isRemoteAudioMuted;
+      // Se o usuário já interagiu com a tela, aplica o áudio configurado
+      if (state.userHasInteracted && !state.isRemoteAudioMuted) {
+        videoEl.muted = false;
+        videoEl.volume = state.globalVolume;
+      } else {
+        videoEl.muted = true;
+      }
     }
 
-    const startPlayback = () => {
+    const triggerPlay = () => {
       const playPromise = videoEl.play();
       if (playPromise !== undefined) {
         playPromise.catch(err => {
-          console.warn('[Video] Play automático com som bloqueado, tentando com áudio mutado:', err);
+          console.warn('[Video] Play automático com áudio bloqueado, forçando play mutado:', err);
           videoEl.muted = true;
-          videoEl.play().catch(e => console.error('[Video] Erro na reprodução do vídeo:', e));
+          videoEl.play().catch(e => console.error('[Video] Falha crítica de reprodução:', e));
         });
       }
     };
 
-    if (videoEl.readyState >= 2) {
-      startPlayback();
-    } else {
-      videoEl.onloadedmetadata = () => startPlayback();
-    }
+    // Escuta quando novas tracks (como vídeo) são adicionadas dinamicamente ao stream
+    stream.onaddtrack = () => {
+      console.log('[WebRTC] Nova track detectada no stream, atualizando viewport');
+      videoEl.srcObject = stream;
+      triggerPlay();
+    };
+
+    videoEl.onloadedmetadata = triggerPlay;
+    videoEl.onloadeddata = triggerPlay;
+    videoEl.oncanplay = triggerPlay;
+
+    triggerPlay();
   }
 
   function renderLocalVideoCard(stream) {
@@ -1233,7 +1285,7 @@
       card.id = cardId;
       card.className = 'video-card';
       card.innerHTML = `
-        <video id="video-${peerId}" autoplay playsinline></video>
+        <video id="video-${peerId}" autoplay playsinline muted></video>
         
         <div class="video-overlay-top">
           <div class="video-user-badge">
@@ -1275,7 +1327,12 @@
 
       if (cardVolBtn && video) {
         cardVolBtn.addEventListener('click', () => {
+          state.userHasInteracted = true;
           video.muted = !video.muted;
+          if (!video.muted) {
+            video.volume = state.globalVolume || 0.8;
+            video.play().catch(() => {});
+          }
           const icon = cardVolBtn.querySelector('i');
           if (icon) {
             if (video.muted) {
@@ -1291,10 +1348,14 @@
 
       if (cardVolSlider && video) {
         cardVolSlider.addEventListener('input', (e) => {
+          state.userHasInteracted = true;
           const val = parseInt(e.target.value, 10);
           const fraction = val / 100;
           video.volume = fraction;
           video.muted = val === 0;
+          if (val > 0) {
+            video.play().catch(() => {});
+          }
 
           const icon = cardVolBtn ? cardVolBtn.querySelector('i') : null;
           if (icon) {
