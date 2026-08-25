@@ -905,12 +905,22 @@
   function startTurboCaptureLoop(stream) {
     stopTurboCaptureLoop();
 
-    const video = document.createElement('video');
-    video.autoplay = true;
-    video.muted = true;
-    video.playsInline = true;
+    // Cria elemento de vídeo conectado ao DOM para garantir que a GPU do navegador não pause a decodificação
+    let video = document.getElementById('turbo-capture-hidden-video');
+    if (!video) {
+      video = document.createElement('video');
+      video.id = 'turbo-capture-hidden-video';
+      video.autoplay = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.setAttribute('playsinline', '');
+      video.setAttribute('webkit-playsinline', '');
+      video.style.cssText = 'position:fixed;bottom:0;right:0;width:16px;height:16px;opacity:0.01;pointer-events:none;z-index:-999;';
+      document.body.appendChild(video);
+    }
+
     video.srcObject = stream;
-    video.play().catch(() => {});
+    video.play().catch((e) => console.warn('[Turbo Video Play]', e));
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -919,20 +929,35 @@
     state.turboCaptureCanvas = canvas;
     state.turboCaptureCtx = ctx;
 
-    const intervalMs = Math.round(1000 / state.streamFps);
-    const jpegQuality = state.streamQuality === '1080p' ? 0.75 : (state.streamQuality === '720p' ? 0.68 : 0.60);
+    const fps = state.streamFps || 30;
+    const intervalMs = Math.round(1000 / fps);
+    const jpegQuality = state.streamQuality === '1080p' ? 0.72 : (state.streamQuality === '720p' ? 0.65 : 0.55);
 
-    let isCapturing = false;
+    let isEncoding = false;
+    let lastFrameSent = 0;
+    let rVFCId = null;
 
-    state.turboCaptureTimer = setInterval(() => {
-      if (!state.isSharingScreen || !state.localScreenStream || isCapturing) return;
-      if (video.readyState < 2) return;
+    const captureAndEmitFrame = () => {
+      if (!state.isSharingScreen || !state.localScreenStream) return;
+      const now = Date.now();
+      
+      // Respeita taxa de quadros (FPS)
+      if (now - lastFrameSent < intervalMs - 5) return;
 
-      isCapturing = true;
+      const v = (document.getElementById('local-video') && document.getElementById('local-video').readyState >= 2) 
+        ? document.getElementById('local-video') 
+        : video;
+
+      if (v.readyState < 2 || isEncoding) return;
+
+      let width = v.videoWidth || 1280;
+      let height = v.videoHeight || 720;
+      if (width === 0 || height === 0) return;
+
+      isEncoding = true;
+      lastFrameSent = now;
+
       try {
-        let width = video.videoWidth || 1280;
-        let height = video.videoHeight || 720;
-
         // Escala para resolução selecionada
         let maxW = 1280;
         if (state.streamQuality === '1080p') maxW = 1920;
@@ -944,14 +969,14 @@
           height = Math.round(height * ratio);
         }
 
-        canvas.width = width;
-        canvas.height = height;
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
 
-        ctx.drawImage(video, 0, 0, width, height);
-
+        ctx.drawImage(v, 0, 0, width, height);
         const frameData = canvas.toDataURL('image/jpeg', jpegQuality);
 
-        // Envia via Socket.IO ou MQTT
         if (state.transportType === 'socket.io' && state.socket && state.socket.connected) {
           state.socket.emit('stream-frame', {
             frame: frameData,
@@ -959,7 +984,7 @@
             height,
             fps: state.streamFps,
             mode: state.currentSharingMode,
-            timestamp: Date.now()
+            timestamp: now
           });
         } else if (state.mqttClient && state.mqttConnected) {
           const topic = `ssl_v3/${state.roomId}/frames`;
@@ -972,46 +997,68 @@
             height,
             fps: state.streamFps,
             mode: state.currentSharingMode,
-            timestamp: Date.now()
+            timestamp: now
           }), { qos: 0 });
         }
       } catch (err) {
-        console.warn('[Turbo Capture] Erro ao extrair quadro:', err);
+        console.warn('[Turbo Capture] Erro ao codificar quadro:', err);
       } finally {
-        isCapturing = false;
+        isEncoding = false;
       }
-    }, intervalMs);
+    };
+
+    // Usar requestVideoFrameCallback se disponível no navegador para fluidez perfeita
+    const frameCallbackLoop = () => {
+      if (!state.isSharingScreen) return;
+      captureAndEmitFrame();
+      if ('requestVideoFrameCallback' in video) {
+        rVFCId = video.requestVideoFrameCallback(frameCallbackLoop);
+      }
+    };
+
+    if ('requestVideoFrameCallback' in video) {
+      rVFCId = video.requestVideoFrameCallback(frameCallbackLoop);
+    }
+
+    // Intervalo de segurança / fallback contínuo
+    state.turboCaptureTimer = setInterval(captureAndEmitFrame, intervalMs);
+
+    // Salva referência do callback loop para cancelamento limpo
+    state.turboRVFC = () => {
+      if (rVFCId && 'cancelVideoFrameCallback' in video) {
+        try { video.cancelVideoFrameCallback(rVFCId); } catch (e) {}
+      }
+    };
 
     // Captura e Transmissão de Áudio Turbo em tempo real
     startTurboAudioCapture(stream);
   }
 
   function captureAndSendTurboFrame(forceImmediate = false) {
-    if (!state.turboCaptureVideo || !state.turboCaptureCanvas || !state.turboCaptureCtx) return;
+    if (!state.turboCaptureCanvas || !state.turboCaptureCtx) return;
     try {
-      const video = state.turboCaptureVideo;
+      const v = document.getElementById('local-video') || state.turboCaptureVideo;
+      if (!v || v.readyState < 2) return;
+
       const canvas = state.turboCaptureCanvas;
       const ctx = state.turboCaptureCtx;
+      let width = v.videoWidth || 1280;
+      let height = v.videoHeight || 720;
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(v, 0, 0, width, height);
+      const frameData = canvas.toDataURL('image/jpeg', 0.7);
 
-      if (video.readyState >= 2) {
-        let width = video.videoWidth || 1280;
-        let height = video.videoHeight || 720;
-        canvas.width = width;
-        canvas.height = height;
-        ctx.drawImage(video, 0, 0, width, height);
-        const frameData = canvas.toDataURL('image/jpeg', 0.7);
-
-        if (state.transportType === 'socket.io' && state.socket && state.socket.connected) {
-          state.socket.emit('stream-frame', {
-            frame: frameData,
-            width,
-            height,
-            fps: state.streamFps,
-            mode: state.currentSharingMode,
-            timestamp: Date.now(),
-            isKeyframe: true
-          });
-        }
+      if (state.transportType === 'socket.io' && state.socket && state.socket.connected) {
+        state.socket.emit('stream-frame', {
+          frame: frameData,
+          width,
+          height,
+          fps: state.streamFps,
+          mode: state.currentSharingMode,
+          timestamp: Date.now(),
+          isKeyframe: true
+        });
       }
     } catch (e) {}
   }
@@ -1031,7 +1078,6 @@
       processor.onaudioprocess = (e) => {
         if (!state.isSharingScreen) return;
         const inputData = e.inputBuffer.getChannelData(0);
-        // Downsample / Compressão de array float32
         const pcmData = Array.from(inputData);
 
         if (state.transportType === 'socket.io' && state.socket && state.socket.connected) {
@@ -1049,6 +1095,10 @@
   }
 
   function stopTurboCaptureLoop() {
+    if (state.turboRVFC) {
+      try { state.turboRVFC(); } catch (e) {}
+      state.turboRVFC = null;
+    }
     if (state.turboCaptureTimer) {
       clearInterval(state.turboCaptureTimer);
       state.turboCaptureTimer = null;
@@ -1056,6 +1106,9 @@
     if (state.turboCaptureVideo) {
       state.turboCaptureVideo.pause();
       state.turboCaptureVideo.srcObject = null;
+      if (state.turboCaptureVideo.parentNode) {
+        state.turboCaptureVideo.parentNode.removeChild(state.turboCaptureVideo);
+      }
       state.turboCaptureVideo = null;
     }
     if (state.turboAudioRecorder) {
@@ -1192,15 +1245,38 @@
 
     viewer.lastFrameTime = Date.now();
 
-    const img = viewer.imageObj || new Image();
+    // Se já estiver decodificando um quadro, guarda o mais recente para renderizar logo após
+    if (viewer.isRendering) {
+      viewer.pendingFrame = data.frame;
+      return;
+    }
+
+    viewer.isRendering = true;
+    const img = new Image();
     img.onload = () => {
-      const canvas = viewer.canvas;
-      const ctx = viewer.ctx;
-      if (canvas.width !== img.width || canvas.height !== img.height) {
-        canvas.width = img.width;
-        canvas.height = img.height;
+      try {
+        const canvas = viewer.canvas;
+        const ctx = viewer.ctx;
+        if (canvas && ctx) {
+          if (canvas.width !== img.width || canvas.height !== img.height) {
+            canvas.width = img.width;
+            canvas.height = img.height;
+          }
+          ctx.drawImage(img, 0, 0);
+        }
+      } catch (e) {
+        console.warn('[Turbo Viewer] Erro ao desenhar frame:', e);
+      } finally {
+        viewer.isRendering = false;
+        if (viewer.pendingFrame) {
+          const next = viewer.pendingFrame;
+          viewer.pendingFrame = null;
+          handleIncomingTurboFrame({ ...data, frame: next });
+        }
       }
-      ctx.drawImage(img, 0, 0);
+    };
+    img.onerror = () => {
+      viewer.isRendering = false;
     };
     img.src = data.frame;
   }
@@ -1447,7 +1523,13 @@
     }
 
     const videoEl = card.querySelector('#local-video');
+    videoEl.playsInline = true;
+    videoEl.muted = true;
+    videoEl.autoplay = true;
+    videoEl.setAttribute('playsinline', '');
+    videoEl.setAttribute('webkit-playsinline', '');
     videoEl.srcObject = stream;
+    videoEl.onloadedmetadata = () => videoEl.play().catch(() => {});
     videoEl.play().catch(() => {});
 
     if (window.lucide) window.lucide.createIcons();
@@ -1560,9 +1642,11 @@
     }
 
     const videoEl = card.querySelector(`#video-${peerId}`);
-    videoEl.srcObject = stream;
     videoEl.playsInline = true;
     videoEl.autoplay = true;
+    videoEl.setAttribute('playsinline', '');
+    videoEl.setAttribute('webkit-playsinline', '');
+    videoEl.srcObject = stream;
 
     if (state.userHasInteracted && !state.isRemoteAudioMuted) {
       videoEl.muted = false;
@@ -1570,6 +1654,13 @@
     } else {
       videoEl.muted = true;
     }
+
+    videoEl.onloadedmetadata = () => videoEl.play().catch(() => {});
+    videoEl.onpause = () => {
+      if (!videoEl.ended && videoEl.srcObject) {
+        videoEl.play().catch(() => {});
+      }
+    };
 
     videoEl.play().catch(() => {
       videoEl.muted = true;
