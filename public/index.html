@@ -20,7 +20,10 @@
   <!-- Ícones Lucide -->
   <script src="https://unpkg.com/lucide@latest"></script>
   
-  <!-- MQTT Client (Serverless WebRTC Signaling em Nuvem para Vercel) -->
+  <!-- Socket.IO Client (Transmissão em Tempo Real de Baixa Latência e Zero Bloqueio) -->
+  <script src="/socket.io/socket.io.js"></script>
+  
+  <!-- MQTT Client (Fallback Serverless para Vercel / Ambientes Estáticos) -->
   <script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
   
   <!-- Estilos da Aplicação -->
@@ -29,6 +32,84 @@
 <body class="dark-theme">
   <!-- Toast de Notificações -->
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- Modal de Seleção de Modo de Compartilhamento (Anti-Tela Preta) -->
+  <div id="share-mode-modal" class="modal-overlay hidden">
+    <div class="share-mode-card">
+      <div class="share-mode-header">
+        <div class="share-mode-badge">
+          <i data-lucide="sparkles"></i>
+        </div>
+        <div>
+          <h2 class="share-mode-title">Escolha o Modo de Compartilhamento</h2>
+          <p class="share-mode-subtitle">Selecione a tecnologia ideal para o seu dispositivo e conexão de rede.</p>
+        </div>
+        <button id="btn-close-share-mode-modal" class="btn-icon-subtle" title="Fechar">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+
+      <div class="share-mode-options">
+        <!-- Opção 1: Turbo WebSocket (Padrão e Recomendado) -->
+        <label class="mode-option-card active" data-mode="turbo">
+          <input type="radio" name="sharing-engine" value="turbo" checked>
+          <div class="mode-option-icon turbo">
+            <i data-lucide="zap"></i>
+          </div>
+          <div class="mode-option-info">
+            <div class="mode-option-header">
+              <span class="mode-title">Modo Turbo WebSocket</span>
+              <span class="mode-tag recommended">100% Compatível / Sem Tela Preta</span>
+            </div>
+            <p class="mode-desc">Transmite quadros de vídeo e áudio continuamente via WebSocket direto. Funciona sem falhas em celulares, Wi-Fi, 4G/5G, Macs, PCs e redes com firewall restritivo.</p>
+          </div>
+        </label>
+
+        <!-- Opção 2: WebRTC P2P Direto -->
+        <label class="mode-option-card" data-mode="webrtc">
+          <input type="radio" name="sharing-engine" value="webrtc">
+          <div class="mode-option-icon webrtc">
+            <i data-lucide="network"></i>
+          </div>
+          <div class="mode-option-info">
+            <div class="mode-option-header">
+              <span class="mode-title">Modo WebRTC P2P Direto</span>
+              <span class="mode-tag">Ultra HD 60 FPS</span>
+            </div>
+            <p class="mode-desc">Conexão ponto a ponto nativa do navegador. Indicado para redes locais ou conexões de fibra sem restrições de firewall/NAT.</p>
+          </div>
+        </label>
+      </div>
+
+      <!-- Configurações de Resolução e Desempenho -->
+      <div class="share-settings-box">
+        <div class="settings-row">
+          <label><i data-lucide="sliders"></i> Qualidade da Transmissão:</label>
+          <select id="select-stream-quality" class="styled-select">
+            <option value="1080p">1080p Full HD (Máxima Nitidez)</option>
+            <option value="720p" selected>720p HD (Equilibrado / Recomendado)</option>
+            <option value="480p">480p Fluido (Para Conexões Lentas / Celulares)</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label><i data-lucide="gauge"></i> Taxa de Quadros (FPS):</label>
+          <select id="select-stream-fps" class="styled-select">
+            <option value="30" selected>30 FPS (Padrão Suave)</option>
+            <option value="60">60 FPS (Ultra Fluido / Jogos)</option>
+            <option value="15">15 FPS (Economia de Dados)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="share-mode-footer">
+        <button id="btn-cancel-share-modal" class="btn btn-secondary">Cancelar</button>
+        <button id="btn-confirm-start-share" class="btn btn-primary btn-large">
+          <i data-lucide="screen-share"></i>
+          <span>Iniciar Transmissão</span>
+        </button>
+      </div>
+    </div>
+  </div>
 
   <!-- Modal de Entrada / Criação de Sala (Lobby) -->
   <div id="lobby-modal" class="modal-overlay">

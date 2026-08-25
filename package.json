@@ -7,7 +7,7 @@
     "dev": "node server.js",
     "start": "node server.js",
     "build": "echo 'Build complete'",
-    "lint": "node -c server.js"
+    "lint": "node -c server.js && node -c public/script.js"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

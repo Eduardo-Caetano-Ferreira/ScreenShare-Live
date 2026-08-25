@@ -1,18 +1,365 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
-    <meta name="description" content="An application built with Google AI Studio." />
-    <meta property="og:title" content="My Google AI Studio App" />
-    <meta property="og:description" content="An application built with Google AI Studio." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ScreenShare Live - Compartilhamento de Tela WebRTC</title>
+  <meta name="description" content="Compartilhamento de tela em tempo real, multi-peer, baixa latência e qualidade ultra HD via WebRTC.">
+  <meta name="theme-color" content="#0F172A">
+  
+  <!-- Ícone do Separador / Favicon -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="apple-touch-icon" href="/favicon.svg">
+  
+  <!-- Fontes Google -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  
+  <!-- Ícones Lucide -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <!-- Socket.IO Client (Transmissão em Tempo Real de Baixa Latência e Zero Bloqueio) -->
+  <script src="/socket.io/socket.io.js"></script>
+  
+  <!-- MQTT Client (Fallback Serverless para Vercel / Ambientes Estáticos) -->
+  <script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
+  
+  <!-- Estilos da Aplicação -->
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="dark-theme">
+  <!-- Toast de Notificações -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
+  <!-- Modal de Seleção de Modo de Compartilhamento (Anti-Tela Preta) -->
+  <div id="share-mode-modal" class="modal-overlay hidden">
+    <div class="share-mode-card">
+      <div class="share-mode-header">
+        <div class="share-mode-badge">
+          <i data-lucide="sparkles"></i>
+        </div>
+        <div>
+          <h2 class="share-mode-title">Escolha o Modo de Compartilhamento</h2>
+          <p class="share-mode-subtitle">Selecione a tecnologia ideal para o seu dispositivo e conexão de rede.</p>
+        </div>
+        <button id="btn-close-share-mode-modal" class="btn-icon-subtle" title="Fechar">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+
+      <div class="share-mode-options">
+        <!-- Opção 1: Turbo WebSocket (Padrão e Recomendado) -->
+        <label class="mode-option-card active" data-mode="turbo">
+          <input type="radio" name="sharing-engine" value="turbo" checked>
+          <div class="mode-option-icon turbo">
+            <i data-lucide="zap"></i>
+          </div>
+          <div class="mode-option-info">
+            <div class="mode-option-header">
+              <span class="mode-title">Modo Turbo WebSocket</span>
+              <span class="mode-tag recommended">100% Compatível / Sem Tela Preta</span>
+            </div>
+            <p class="mode-desc">Transmite quadros de vídeo e áudio continuamente via WebSocket direto. Funciona sem falhas em celulares, Wi-Fi, 4G/5G, Macs, PCs e redes com firewall restritivo.</p>
+          </div>
+        </label>
+
+        <!-- Opção 2: WebRTC P2P Direto -->
+        <label class="mode-option-card" data-mode="webrtc">
+          <input type="radio" name="sharing-engine" value="webrtc">
+          <div class="mode-option-icon webrtc">
+            <i data-lucide="network"></i>
+          </div>
+          <div class="mode-option-info">
+            <div class="mode-option-header">
+              <span class="mode-title">Modo WebRTC P2P Direto</span>
+              <span class="mode-tag">Ultra HD 60 FPS</span>
+            </div>
+            <p class="mode-desc">Conexão ponto a ponto nativa do navegador. Indicado para redes locais ou conexões de fibra sem restrições de firewall/NAT.</p>
+          </div>
+        </label>
+      </div>
+
+      <!-- Configurações de Resolução e Desempenho -->
+      <div class="share-settings-box">
+        <div class="settings-row">
+          <label><i data-lucide="sliders"></i> Qualidade da Transmissão:</label>
+          <select id="select-stream-quality" class="styled-select">
+            <option value="1080p">1080p Full HD (Máxima Nitidez)</option>
+            <option value="720p" selected>720p HD (Equilibrado / Recomendado)</option>
+            <option value="480p">480p Fluido (Para Conexões Lentas / Celulares)</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label><i data-lucide="gauge"></i> Taxa de Quadros (FPS):</label>
+          <select id="select-stream-fps" class="styled-select">
+            <option value="30" selected>30 FPS (Padrão Suave)</option>
+            <option value="60">60 FPS (Ultra Fluido / Jogos)</option>
+            <option value="15">15 FPS (Economia de Dados)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="share-mode-footer">
+        <button id="btn-cancel-share-modal" class="btn btn-secondary">Cancelar</button>
+        <button id="btn-confirm-start-share" class="btn btn-primary btn-large">
+          <i data-lucide="screen-share"></i>
+          <span>Iniciar Transmissão</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal de Entrada / Criação de Sala (Lobby) -->
+  <div id="lobby-modal" class="modal-overlay">
+    <div class="lobby-card">
+      <div class="lobby-header">
+        <div class="brand-badge">
+          <i data-lucide="cast" class="brand-icon"></i>
+          <span class="live-dot"></span>
+        </div>
+        <h1 class="lobby-title">ScreenShare Live</h1>
+        <p class="lobby-subtitle">Compartilhamento de tela colaborativo em tempo real via WebRTC P2P.</p>
+      </div>
+
+      <div class="lobby-body">
+        <div class="input-group">
+          <label for="user-name-input">Seu Nome / Apelido</label>
+          <div class="input-wrapper">
+            <i data-lucide="user" class="input-icon"></i>
+            <input type="text" id="user-name-input" placeholder="Ex: Lucas Silva" maxlength="24" autocomplete="name">
+          </div>
+        </div>
+
+        <div class="lobby-actions">
+          <button id="btn-create-room" class="btn btn-primary btn-large">
+            <i data-lucide="plus-circle"></i>
+            <span>Criar Nova Sala</span>
+          </button>
+
+          <div class="divider">
+            <span>ou entre em uma sala existente</span>
+          </div>
+
+          <div class="join-room-row">
+            <div class="input-wrapper">
+              <i data-lucide="hash" class="input-icon"></i>
+              <input type="text" id="room-code-input" placeholder="Código da Sala (ex: live-hub-123)">
+            </div>
+            <button id="btn-join-room" class="btn btn-secondary">
+              <span>Entrar</span>
+              <i data-lucide="arrow-right"></i>
+            </button>
+          </div>
+        </div>
+
+        <div class="lobby-features">
+          <div class="feature-tag"><i data-lucide="zap"></i> Ultra Baixa Latência</div>
+          <div class="feature-tag"><i data-lucide="users"></i> Multi-Transmissores</div>
+          <div class="feature-tag"><i data-lucide="shield-check"></i> Conexão Direta P2P</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Interface Principal da Sala (Room View) -->
+  <div id="room-container" class="room-container hidden">
+    
+    <!-- Barra Superior / Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="app-brand">
+          <i data-lucide="cast" class="logo-icon"></i>
+          <span class="brand-name">ScreenShare <span class="accent-text">Live</span></span>
+        </div>
+
+        <div class="room-badge-container">
+          <span class="badge-label">SALA:</span>
+          <span id="header-room-id" class="room-id-tag">---</span>
+          <button id="btn-copy-link" class="btn-icon-subtle" title="Copiar link de convite">
+            <i data-lucide="copy"></i>
+            <span class="btn-text">Copiar Link</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <!-- Botão de Ação Rápida para Finalizar Transmissão (visível apenas quando transmitindo) -->
+        <button id="btn-header-stop-share" class="btn-stop-broadcast hidden" title="Finalizar Transmissão de Tela">
+          <i data-lucide="square"></i>
+          <span>Finalizar Transmissão</span>
+        </button>
+
+        <!-- Indicador de status de conexão -->
+        <div class="status-indicator online">
+          <span class="status-dot"></span>
+          <span id="connection-status-text">Conectado P2P</span>
+        </div>
+
+        <!-- Botão Lista de Participantes -->
+        <button id="btn-toggle-participants" class="header-btn" title="Ver participantes">
+          <i data-lucide="users"></i>
+          <span id="participant-count-badge" class="count-badge">1</span>
+        </button>
+
+        <!-- Botão Chat -->
+        <button id="btn-toggle-chat" class="header-btn" title="Chat da Sala">
+          <i data-lucide="message-square"></i>
+          <span id="chat-unread-badge" class="unread-dot hidden"></span>
+        </button>
+
+        <!-- Botão Sair -->
+        <button id="btn-leave-room" class="btn-danger-outline" title="Sair da Sala (encerra transmissão)">
+          <i data-lucide="log-out"></i>
+          <span>Sair</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Banner de Alerta de Transmissão Ativa -->
+    <div id="sharing-active-bar" class="sharing-active-bar hidden">
+      <div class="sharing-bar-content">
+        <div class="sharing-bar-info">
+          <span class="live-pulse-badge">
+            <span class="live-pulse-dot"></span>
+            AO VIVO
+          </span>
+          <span class="sharing-bar-text">Você está transmitindo sua tela para todos na sala.</span>
+        </div>
+        <button id="btn-banner-stop-share" class="btn btn-stop-share-banner">
+          <i data-lucide="square"></i>
+          <span>Finalizar Transmissão</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Área de Conteúdo Principal (Grid de Vídeos + Sidebar) -->
+    <main class="main-content">
+      
+      <!-- Container das Telas Compartilhadas -->
+      <section class="video-section">
+        
+        <!-- Estado Vazio (Nenhuma tela sendo transmitida) -->
+        <div id="empty-state" class="empty-state">
+          <div class="empty-state-card">
+            <div class="empty-icon-wrap">
+              <i data-lucide="monitor-up"></i>
+            </div>
+            <h2>Nenhuma tela está sendo compartilhada</h2>
+            <p>Seja o primeiro a transmitir para os participantes desta sala ou convide outras pessoas usando o link.</p>
+            <div class="empty-actions">
+              <button id="btn-empty-start-share" class="btn btn-primary btn-large">
+                <i data-lucide="screen-share"></i>
+                <span>Compartilhar Minha Tela Agora</span>
+              </button>
+              <button id="btn-empty-copy" class="btn btn-secondary">
+                <i data-lucide="link"></i>
+                <span>Copiar Link de Convite</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Grade Dinâmica de Telas WebRTC -->
+        <div id="video-grid" class="video-grid hidden">
+          <!-- Os cards de vídeo (locais e remotos) são inseridos aqui dinamicamente pelo script.js -->
+        </div>
+
+      </section>
+
+      <!-- Barra Lateral: Chat e Participantes (Gaveta) -->
+      <aside id="sidebar" class="sidebar hidden">
+        <div class="sidebar-header">
+          <div class="sidebar-tabs">
+            <button id="tab-chat" class="tab-btn active">
+              <i data-lucide="message-square"></i>
+              <span>Chat</span>
+            </button>
+            <button id="tab-users" class="tab-btn">
+              <i data-lucide="users"></i>
+              <span>Participantes (<span id="tab-users-count">1</span>)</span>
+            </button>
+          </div>
+          <button id="btn-close-sidebar" class="btn-icon-subtle" title="Fechar painel">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+
+        <!-- Painel de Chat -->
+        <div id="panel-chat" class="sidebar-panel active">
+          <div id="chat-messages" class="chat-messages">
+            <div class="system-message">
+              <i data-lucide="info"></i>
+              <span>Bem-vindo à sala! Mensagens enviadas aqui são compartilhadas em tempo real com todos.</span>
+            </div>
+          </div>
+          <form id="chat-form" class="chat-form">
+            <input type="text" id="chat-input" placeholder="Digite uma mensagem..." maxlength="300" autocomplete="off">
+            <button type="submit" class="btn-send" title="Enviar">
+              <i data-lucide="send"></i>
+            </button>
+          </form>
+        </div>
+
+        <!-- Painel de Participantes -->
+        <div id="panel-users" class="sidebar-panel">
+          <ul id="participants-list" class="participants-list">
+            <!-- Renderizado dinamicamente -->
+          </ul>
+        </div>
+      </aside>
+
+    </main>
+
+    <!-- Barra Flutuante de Controles Inferior -->
+    <footer class="controls-bar-container">
+      <div class="controls-bar">
+        
+        <!-- Botão Principal: Compartilhar Tela -->
+        <button id="btn-toggle-screen-share" class="control-btn btn-share-main" title="Compartilhar Tela">
+          <i data-lucide="screen-share" id="icon-share"></i>
+          <span id="text-share">Compartilhar Tela</span>
+        </button>
+
+        <div class="controls-divider"></div>
+
+        <!-- Alternar Microfone de Apoio -->
+        <button id="btn-toggle-mic" class="control-btn" title="Ligar / Desligar Microfone">
+          <i data-lucide="mic-off" id="icon-mic"></i>
+          <span class="control-label">Microfone</span>
+        </button>
+
+        <!-- Controle de Volume Geral de Transmissões Remotas -->
+        <div class="control-volume-group" title="Controle de volume das transmissões">
+          <button id="btn-toggle-audio-mute" class="control-btn control-btn-volume" title="Mutar/Desmutar Áudio">
+            <i data-lucide="volume-2" id="icon-volume"></i>
+            <span class="control-label">Áudio</span>
+          </button>
+          <div class="volume-slider-popup">
+            <input type="range" id="global-volume-slider" min="0" max="100" value="100" class="volume-range-input" title="Volume Geral">
+            <span id="global-volume-text" class="volume-percent-badge">100%</span>
+          </div>
+        </div>
+
+        <!-- Layout Grid / Foco -->
+        <button id="btn-toggle-layout" class="control-btn" title="Alternar Layout">
+          <i data-lucide="layout-grid" id="icon-layout"></i>
+          <span class="control-label">Layout</span>
+        </button>
+
+        <!-- Tela Cheia Geral -->
+        <button id="btn-fullscreen-all" class="control-btn" title="Tela Cheia">
+          <i data-lucide="maximize"></i>
+          <span class="control-label">Expandir</span>
+        </button>
+
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- Scripts -->
+  <script src="/script.js"></script>
+</body>
+</html>

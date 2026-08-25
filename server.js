@@ -126,23 +126,58 @@ io.on('connection', (socket) => {
   });
 
   // Atualização de status de compartilhamento de tela
-  socket.on('sharing-status', ({ isSharing }) => {
+  socket.on('sharing-status', ({ isSharing, mode, width, height, fps }) => {
     if (!currentRoom || !rooms.has(currentRoom)) return;
 
     const roomUsers = rooms.get(currentRoom);
     if (roomUsers.has(socket.id)) {
       const user = roomUsers.get(socket.id);
       user.isSharing = isSharing;
+      user.streamMode = mode || 'turbo';
       currentUser.isSharing = isSharing;
+      currentUser.streamMode = mode || 'turbo';
 
       // Transmite a todos na sala
       io.in(currentRoom).emit('user-sharing-status', {
         userId: socket.id,
         userName: user.name,
-        isSharing
+        isSharing,
+        mode: mode || 'turbo',
+        width,
+        height,
+        fps
       });
 
       io.in(currentRoom).emit('room-users-updated', Array.from(roomUsers.values()));
+    }
+  });
+
+  // MODO TURBO (WebSocket Relay Frame): Transmissão de frames da tela (100% Anti-Tela Preta)
+  socket.on('stream-frame', (frameData) => {
+    if (!currentRoom) return;
+    // Repassa o frame instantaneamente para todos os espectadores na sala
+    socket.to(currentRoom).emit('stream-frame', {
+      senderId: socket.id,
+      senderName: currentUser?.name || 'Participante',
+      ...frameData
+    });
+  });
+
+  // MODO TURBO: Áudio em tempo real via WebSocket
+  socket.on('stream-audio-chunk', (audioData) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('stream-audio-chunk', {
+      senderId: socket.id,
+      ...audioData
+    });
+  });
+
+  // Pedido de keyframe / frame imediato por um espectador
+  socket.on('request-keyframe', ({ targetId }) => {
+    if (targetId) {
+      socket.to(targetId).emit('request-keyframe', { requesterId: socket.id });
+    } else if (currentRoom) {
+      socket.to(currentRoom).emit('request-keyframe', { requesterId: socket.id });
     }
   });
 
